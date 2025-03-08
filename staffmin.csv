@@ -1,0 +1,8 @@
+Day,Shift_1_Min,Shift_1_Max,Shift_2_Min,Shift_2_Max,Shift_3_Min,Shift_3_Max,Shift_4_Min,Shift_4_Max,Total_Min,Total_Max
+Dimanche,7,11,4,7,7,13,1,1,27,33
+Lundi,7,11,4,7,7,11,1,1,27,33
+Mardi,7,11,4,7,7,13,1,1,27,33
+Mercredi,7,11,4,7,7,15,1,1,27,33
+Jeudi,7,11,4,7,7,11,1,1,27,33
+Vendredi,7,11,4,7,7,15,1,1,27,33
+Samedi,7,11,4,7,7,15,1,1,27,33
