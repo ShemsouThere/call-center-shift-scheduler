@@ -1,31 +1,46 @@
 from ortools.sat.python import cp_model
-import csv, sqlite3
+import csv
+import sqlite3
+from pathlib import Path
 import pandas as pd
-from datetime import datetime, timedelta
-import random
+
+
+DAYS_OF_WEEK = ['Dimanche', 'Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi']
 
 
 class CallCenterShiftScheduler:
-    def __init__(self):
+    def __init__(self, db_path='call_center.db', staffmin_path='staffmin.csv', manual_shifts_path='manual_shifts.csv'):
+        self.db_path = Path(db_path)
+        self.staffmin_path = Path(staffmin_path)
+        self.manual_shifts_path = Path(manual_shifts_path)
+
+        self._validate_input_files()
+
         # Connect to the database
-        self.conn = sqlite3.connect('call_center.db')
+        self.conn = sqlite3.connect(self.db_path)
         self.cursor = self.conn.cursor()
    
         # Load employees from the database
-        self.employees_df = pd.read_sql_query('SELECT Employee_Id, Status, First_Name, Last_Name, transport FROM employees', self.conn)
-        self.cursor.execute('SELECT Employee_Id, Status, First_Name, Last_Name, transport FROM employees')
-        self.employees = self.cursor.fetchall()
+        self.employees_df = pd.read_sql_query(
+            'SELECT * FROM employees',
+            self.conn
+        )
+        self._validate_employees_schema()
+        self.employees = self.employees_df[
+            ['Employee_Id', 'Status', 'First_Name', 'Last_Name', 'transport']
+        ].itertuples(index=False, name=None)
+        self.employees = list(self.employees)
         self.num_workers = len(self.employees)
 
         # Load availability from the database
-        self.cursor.execute('SELECT * FROM availability')
-        self.availability = self.cursor.fetchall()
-        
-        # Load manual shifts from CSV
-        self.manual_shifts_df = pd.read_csv('manual_shifts.csv')
+        self.availability_df = pd.read_sql_query(
+            'SELECT Employee_Id, Shift_1, Shift_2, Shift_3, Shift_4, Hours FROM availability',
+            self.conn
+        )
+        self._validate_availability_schema()
 
-        # Convert availability to a DataFrame for easier access
-        self.availability_df = pd.DataFrame(self.availability, columns=['Employee_Id', 'Shift_1', 'Shift_2', 'Shift_3', 'Shift_4', 'Hours'])
+        # Load manual shifts from CSV (optional)
+        self.manual_shifts_df = self._load_manual_shifts()
 
         # Default shift times
         self.num_shifts = 4
@@ -41,17 +56,69 @@ class CallCenterShiftScheduler:
         if self.num_shifts < len(self.shift_times):
             self.shift_times = {k: v for k, v in self.shift_times.items() if k < self.num_shifts}
 
-        # Initialize gender information (assuming all employees are male)
-        self.is_male = [True] * self.num_workers
+        # Initialize gender information (best effort)
+        self.is_male = self._infer_gender_flags()
 
         # Load shift constraints
-        self.shift_constraints = self.load_shift_constraints('staffmin.csv')
+        self.shift_constraints = self.load_shift_constraints(self.staffmin_path)
 
         # Max iterations for solver
         self.max_iterations = 1000
         
         # Pre-check feasibility of the problem
         self.check_basic_feasibility()
+
+    def _validate_input_files(self):
+        if not self.db_path.exists():
+            raise FileNotFoundError(f"Database file not found: {self.db_path}")
+        if not self.staffmin_path.exists():
+            raise FileNotFoundError(f"Staffing constraints file not found: {self.staffmin_path}")
+
+    def _validate_employees_schema(self):
+        required_cols = {'Employee_Id', 'Status', 'First_Name', 'Last_Name', 'transport'}
+        missing_cols = required_cols - set(self.employees_df.columns)
+        if missing_cols:
+            raise ValueError(f"Employees table missing columns: {sorted(missing_cols)}")
+        if self.employees_df.empty:
+            raise ValueError("Employees table is empty. Add employees before scheduling.")
+
+    def _validate_availability_schema(self):
+        required_cols = {'Employee_Id', 'Shift_1', 'Shift_2', 'Shift_3', 'Shift_4', 'Hours'}
+        missing_cols = required_cols - set(self.availability_df.columns)
+        if missing_cols:
+            raise ValueError(f"Availability table missing columns: {sorted(missing_cols)}")
+
+        missing_availability = set(self.employees_df['Employee_Id']) - set(self.availability_df['Employee_Id'])
+        if missing_availability:
+            raise ValueError(
+                "Availability table is missing employees: "
+                f"{sorted(missing_availability)}"
+            )
+
+    def _infer_gender_flags(self):
+        gender_col = None
+        for candidate in ['Gender', 'gender', 'Sex', 'sex']:
+            if candidate in self.employees_df.columns:
+                gender_col = candidate
+                break
+        if gender_col is None:
+            print("No gender column found in employees table; allowing night shifts for all employees.")
+            return [True] * self.num_workers
+        return [
+            str(value).strip().lower().startswith('m')
+            for value in self.employees_df[gender_col].tolist()
+        ]
+
+    def _load_manual_shifts(self):
+        if not self.manual_shifts_path.exists():
+            print("No manual shifts file found; continuing without manual assignments.")
+            return pd.DataFrame(columns=['Employee_Id', 'Day', 'Shift'])
+        manual_df = pd.read_csv(self.manual_shifts_path)
+        required_cols = {'Employee_Id', 'Day', 'Shift'}
+        missing_cols = required_cols - set(manual_df.columns)
+        if missing_cols:
+            raise ValueError(f"Manual shifts file missing columns: {sorted(missing_cols)}")
+        return manual_df
 
     def check_basic_feasibility(self):
         """Check if basic staffing requirements can be met given worker availability"""
@@ -61,11 +128,10 @@ class CallCenterShiftScheduler:
         available_shifts_per_worker = []
         for i in range(self.num_workers):
             employee_id = self.employees[i][0]
-            # Fetch availability for the employee
-            self.cursor.execute('SELECT Shift_1, Shift_2, Shift_3, Shift_4 FROM availability WHERE Employee_Id = ?', (employee_id,))
-            availability = self.cursor.fetchone()
-            if availability:
-                total_available = sum(availability[j] for j in range(self.num_shifts)) * self.num_days
+            availability = self.availability_df[self.availability_df['Employee_Id'] == employee_id]
+            if not availability.empty:
+                row = availability.iloc[0]
+                total_available = sum(row[f'Shift_{j+1}'] for j in range(self.num_shifts)) * self.num_days
                 available_shifts_per_worker.append(total_available)
             else:
                 available_shifts_per_worker.append(0)
@@ -74,10 +140,9 @@ class CallCenterShiftScheduler:
         print(f"Total available worker-shifts: {total_available_shifts}")
         
         # Calculate minimum required shifts based on constraints
-        day_names = ['Dimanche', 'Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi']
         min_required_shifts = 0
         for k in range(self.num_days):
-            day_name = day_names[k]
+            day_name = DAYS_OF_WEEK[k]
             constraints = self.shift_constraints.get(day_name, {})
             min_required_shifts += constraints.get('Total_Min', 0)
         
@@ -123,20 +188,37 @@ class CallCenterShiftScheduler:
         return constraints
     
     def apply_availability_constraints(self, model, shifts):
-        # Define the order of days corresponding to k in shifts[i][j][k]
-        days_order = ['Dimanche', 'Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi']
-        
         for i in range(self.num_workers):
             employee_id = self.employees[i][0]
-            # Fetch availability for the employee
-            self.cursor.execute('SELECT Shift_1, Shift_2, Shift_3, Shift_4 FROM availability WHERE Employee_Id = ?', (employee_id,))
-            availability = self.cursor.fetchone()
-            if availability:
-                for k in range(self.num_days):
-                    for j in range(self.num_shifts):
-                        if availability[j] == 0:
-                            # Employee is unavailable for this shift on this day
-                            model.Add(shifts[i][j][k] == 0)
+            availability = self.availability_df[self.availability_df['Employee_Id'] == employee_id].iloc[0]
+            for k in range(self.num_days):
+                for j in range(self.num_shifts):
+                    if availability[f'Shift_{j+1}'] == 0:
+                        # Employee is unavailable for this shift on this day
+                        model.Add(shifts[i][j][k] == 0)
+
+    def apply_manual_shifts(self, model, shifts):
+        if self.manual_shifts_df.empty:
+            return
+        for _, row in self.manual_shifts_df.iterrows():
+            employee_id = row['Employee_Id']
+            day_name = row['Day']
+            shift_number = int(row['Shift'])
+            if day_name not in DAYS_OF_WEEK:
+                raise ValueError(f"Invalid day in manual shifts: {day_name}")
+            if shift_number < 1 or shift_number > self.num_shifts:
+                raise ValueError(f"Invalid shift in manual shifts: {shift_number}")
+
+            employee_indices = [
+                idx for idx, emp in enumerate(self.employees) if emp[0] == employee_id
+            ]
+            if not employee_indices:
+                raise ValueError(f"Manual shift references unknown employee: {employee_id}")
+            employee_idx = employee_indices[0]
+            day_idx = DAYS_OF_WEEK.index(day_name)
+
+            # Force the manual shift assignment
+            model.Add(shifts[employee_idx][shift_number - 1][day_idx] == 1)
 
     def create_model_with_relaxation(self, relaxation_level=0, allow_more_shifts=False):
         # Create a new model for each attempt
@@ -146,9 +228,10 @@ class CallCenterShiftScheduler:
         
         # Apply strict availability constraints - these can't be compromised
         self.apply_availability_constraints(model, shifts)
+        self.apply_manual_shifts(model, shifts)
         
         # Define the days of the week
-        day_names = ['Dimanche', 'Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi']
+        day_names = DAYS_OF_WEEK
         
         # Create penalty variables for all soft constraints
         # 1. Penalty for exceeding max workers per shift
@@ -375,7 +458,7 @@ class CallCenterShiftScheduler:
                 shift_counts[j][k] = sum(solver.BooleanValue(shifts[i][j][k]) for i in range(self.num_workers))
         
         # Check minimum staffing requirements
-        day_names = ['Dimanche', 'Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi']
+        day_names = DAYS_OF_WEEK
         staffing_violations = []
         
         for k in range(self.num_days):
@@ -481,14 +564,14 @@ class CallCenterShiftScheduler:
         """Generate a more sophisticated fallback schedule respecting key constraints"""
         print("Generating optimized fallback schedule...")
         
-        day_names = ['Dimanche', 'Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi']
+        day_names = DAYS_OF_WEEK
         assignments = []
         
         # First pass: Prioritize critical shifts (night shifts and high-demand periods)
         # Process shifts in order of difficulty (night shift first, then others)
         shift_order = [3, 2, 1, 0]  # Night shift first, then evening, afternoon, morning
         
-        for shift_idx, shift in enumerate(shift_order):
+        for shift in shift_order:
             for day in range(self.num_days):
                 day_name = day_names[day]
                 constraints = self.shift_constraints.get(day_name, {})
@@ -610,4 +693,23 @@ class CallCenterShiftScheduler:
             shift_count_fields = ['Day'] + list(shift_counts_data[0].keys())[1:]
             writer = csv.DictWriter(file, fieldnames=shift_count_fields)
             writer.writeheader()
-            writer.writerows
+            writer.writerows(shift_counts_data)
+
+        print('Fallback solution exported to fallback_schedule_solution.csv')
+        return True
+
+    def close(self):
+        self.conn.close()
+
+
+def run_scheduler():
+    scheduler = CallCenterShiftScheduler()
+    try:
+        success = scheduler.solve()
+        return success
+    finally:
+        scheduler.close()
+
+
+if __name__ == '__main__':
+    run_scheduler()
